@@ -1,0 +1,267 @@
+import javax.crypto.*;
+import javax.crypto.spec.SecretKeySpec;
+import javax.swing.*;
+import java.awt.*;
+import java.io.*;
+import java.net.*;
+import java.security.*;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.security.spec.ECGenParameterSpec;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
+
+public class BobClient {
+    private static final int LISTEN_PORT = 12346;
+    private static final int CONNECT_PORT = 12345;
+
+    public static void main(String[] args) {
+        JFrame frame = openChatWindow("Bob");
+        JTextArea chatArea = (JTextArea) ((JScrollPane) frame.getContentPane().getComponent(0)).getViewport().getView();
+        JTextField inputField = (JTextField) frame.getContentPane().getComponent(1);
+
+        try {
+            Peer alice = new Peer("Bob", chatArea);
+
+            // Выбор сертификата OpenSSL
+            X509Certificate certificate = chooseCertificate();
+            if (certificate == null) {
+                chatArea.append("No certificate selected, exiting...\n");
+                return;
+            }
+
+            String certInfo = "Certificate Info:\n" +
+                    "Subject: " + certificate.getSubjectDN().toString() + "\n" +
+                    "Issuer: " + certificate.getIssuerDN().toString() + "\n" +
+                    "Valid From: " + certificate.getNotBefore().toString() + "\n" +
+                    "Valid To: " + certificate.getNotAfter().toString() + "\n";
+
+            // Добавление отладочного сообщения
+            System.out.println("Certificate info to be sent: \n" + certInfo);
+
+            // Запуск приема входящих соединений в отдельном потоке
+            new Thread(() -> {
+                try (ServerSocket serverSocket = new ServerSocket(LISTEN_PORT)) {
+                    while (true) {
+                        Socket socket = serverSocket.accept();
+                        new Thread(new ClientHandler(socket, alice)).start();
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }).start();
+
+            // Подключение к другим клиентам
+            while (true) {
+                String remoteIP = JOptionPane.showInputDialog("Введите IP-адрес другого клиента для подключения");
+                if (remoteIP == null || remoteIP.isEmpty()) {
+                    break;
+                }
+
+                try {
+                    Socket socket = new Socket(remoteIP, CONNECT_PORT);
+                    alice.addWriter(new PrintWriter(socket.getOutputStream(), true));
+                    new Thread(new ClientHandler(socket, alice)).start();
+
+                    // Отправка информации о сертификате
+                    alice.broadcast("CERT|" + certInfo);
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+
+            inputField.addActionListener(e -> {
+                String message = inputField.getText();
+                if (!message.isEmpty()) {
+                    try {
+                        // Генерация нового AES-ключа для каждой сессии
+                        SecretKey sessionKey = generateAESKey();
+                        String sessionKeyString = Base64.getEncoder().encodeToString(sessionKey.getEncoded());
+
+                        // Подпись сообщения
+                        Signature signer = Signature.getInstance("SHA256withECDSA");
+                        signer.initSign(alice.keyPair.getPrivate());
+                        signer.update(message.getBytes());
+                        byte[] signatureBytes = signer.sign();
+                        String signature = Base64.getEncoder().encodeToString(signatureBytes);
+
+                        // Шифрование сообщения с использованием нового AES-ключа
+                        String encryptedMessage = encryptMessage(message, sessionKey);
+
+                        // Формирование полного сообщения с передачей зашифрованного AES-ключа
+                        String fullMessage = "MSG|Bob|" + encryptedMessage + "|" + signature + "|" + sessionKeyString + "|" + Base64.getEncoder().encodeToString(alice.getPublicKey().getEncoded());
+                        alice.broadcast(fullMessage);
+                        inputField.setText("");
+                        chatArea.append("Me: " + message + "\n");
+                    } catch (Exception ex) {
+                        ex.printStackTrace();
+                    }
+                }
+            });
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static JFrame openChatWindow(String name) {
+        JFrame frame = new JFrame(name + " Chat");
+        frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        frame.setSize(400, 300);
+        JTextArea chatArea = new JTextArea();
+        chatArea.setEditable(false);
+        JScrollPane scrollPane = new JScrollPane(chatArea);
+        frame.getContentPane().add(scrollPane, BorderLayout.CENTER);
+        JTextField inputField = new JTextField();
+        frame.getContentPane().add(inputField, BorderLayout.SOUTH);
+        frame.setVisible(true);
+        return frame;
+    }
+
+    private static SecretKey generateAESKey() throws NoSuchAlgorithmException {
+        KeyGenerator keyGen = KeyGenerator.getInstance("AES");
+        keyGen.init(256); // Можно использовать 128, 192 или 256 битные ключи
+        return keyGen.generateKey();
+    }
+
+    private static X509Certificate chooseCertificate() {
+        JFileChooser fileChooser = new JFileChooser();
+        fileChooser.setDialogTitle("Выберите сертификат OpenSSL");
+        int result = fileChooser.showOpenDialog(null);
+        if (result == JFileChooser.APPROVE_OPTION) {
+            File selectedFile = fileChooser.getSelectedFile();
+            try (FileInputStream fis = new FileInputStream(selectedFile)) {
+                CertificateFactory cf = CertificateFactory.getInstance("X.509");
+                return (X509Certificate) cf.generateCertificate(fis);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+        return null;
+    }
+
+    private static String encryptMessage(String message, SecretKey key) throws Exception {
+        Cipher cipher = Cipher.getInstance("AES");
+        cipher.init(Cipher.ENCRYPT_MODE, key);
+        byte[] encryptedBytes = cipher.doFinal(message.getBytes());
+        return Base64.getEncoder().encodeToString(encryptedBytes);
+    }
+
+    private static class Peer {
+        private final String name;
+        private final JTextArea chatArea;
+        private final KeyPair keyPair;
+        private final List<PrintWriter> writers = new ArrayList<>();
+
+        public Peer(String name, JTextArea chatArea) throws Exception {
+            this.name = name;
+            this.chatArea = chatArea;
+            this.keyPair = generateKeyPair();
+        }
+
+        public PublicKey getPublicKey() {
+            return keyPair.getPublic();
+        }
+
+        private KeyPair generateKeyPair() throws NoSuchAlgorithmException, InvalidAlgorithmParameterException {
+            KeyPairGenerator keyGen = KeyPairGenerator.getInstance("EC");
+            keyGen.initialize(new ECGenParameterSpec("secp256r1"));
+            return keyGen.generateKeyPair();
+        }
+
+        public void broadcast(String message) {
+            System.out.println("Broadcasting message: " + message); // Добавлено для отладки
+            synchronized (writers) {
+                for (PrintWriter writer : writers) {
+                    writer.println(message);
+                }
+            }
+        }
+
+        public void addWriter(PrintWriter writer) {
+            synchronized (writers) {
+                if (!writers.contains(writer)) {
+                    writers.add(writer);
+                }
+            }
+        }
+    }
+
+    private static class ClientHandler implements Runnable {
+        private final Socket socket;
+        private final Peer peer;
+
+        public ClientHandler(Socket socket, Peer peer) {
+            this.socket = socket;
+            this.peer = peer;
+        }
+
+        @Override
+        public void run() {
+            try (PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+                 BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
+
+                peer.addWriter(out);
+
+                String message;
+                while ((message = in.readLine()) != null) {
+                    System.out.println("Received message: " + message); // Добавлено для отладки
+                    String[] parts = message.split("\\|", 2);
+                    if (parts.length == 2) {
+                        String type = parts[0];
+                        String content = parts[1];
+
+                        if ("CERT".equals(type)) {
+                            SwingUtilities.invokeLater(() -> peer.chatArea.append("Received certificate info:\n" + content + "\n"));
+                        } else if ("MSG".equals(type)) {
+                            String[] msgParts = content.split("\\|");
+                            if (msgParts.length == 5) {
+                                String sender = msgParts[0];
+                                String encryptedMessage = msgParts[1];
+                                String signature = msgParts[2];
+                                String sessionKeyString = msgParts[3];
+                                String publicKeyString = msgParts[4];
+
+                                SecretKey sessionKey = new SecretKeySpec(Base64.getDecoder().decode(sessionKeyString), "AES");
+                                PublicKey publicKey = getPublicKeyFromString(publicKeyString);
+                                String decryptedMessage = decryptMessage(encryptedMessage, sessionKey);
+                                if (verifySignature(publicKey, decryptedMessage, signature)) {
+                                    SwingUtilities.invokeLater(() -> peer.chatArea.append(sender + ": " + decryptedMessage + "\n"));
+                                } else {
+                                    System.out.println("Signature verification failed for message: " + encryptedMessage);
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+
+        private PublicKey getPublicKeyFromString(String key) throws Exception {
+            byte[] byteKey = Base64.getDecoder().decode(key);
+            X509EncodedKeySpec X509publicKey = new X509EncodedKeySpec(byteKey);
+            KeyFactory kf = KeyFactory.getInstance("EC");
+            return kf.generatePublic(X509publicKey);
+        }
+
+        private boolean verifySignature(PublicKey publicKey, String message, String signatureStr) throws Exception {
+            Signature signature = Signature.getInstance("SHA256withECDSA");
+            signature.initVerify(publicKey);
+            signature.update(message.getBytes());
+            byte[] signatureBytes = Base64.getDecoder().decode(signatureStr);
+            return signature.verify(signatureBytes);
+        }
+
+        private String decryptMessage(String encryptedMessage, SecretKey key) throws Exception {
+            Cipher cipher = Cipher.getInstance("AES");
+            cipher.init(Cipher.DECRYPT_MODE, key);
+            byte[] encryptedBytes = Base64.getDecoder().decode(encryptedMessage);
+            byte[] decryptedBytes = cipher.doFinal(encryptedBytes);
+            return new String(decryptedBytes);
+        }
+    }
+}
