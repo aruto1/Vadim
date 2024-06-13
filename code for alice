@@ -13,19 +13,17 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 
-public class PeerChat {
-    private static final int PEER_PORT = 12345;
-    private static final int DISCOVERY_PORT = 12346;
-    private static final String DISCOVERY_MESSAGE = "DISCOVER_PEER";
+public class AliceClient {
+    private static final int LISTEN_PORT = 12345;
+    private static final int CONNECT_PORT = 12346;
 
     public static void main(String[] args) {
-        String peerName = args.length > 0 ? args[0] : "Peer";
-        JFrame frame = openChatWindow(peerName);
+        JFrame frame = openChatWindow("Alice");
         JTextArea chatArea = (JTextArea) ((JScrollPane) frame.getContentPane().getComponent(0)).getViewport().getView();
         JTextField inputField = (JTextField) frame.getContentPane().getComponent(1);
 
         try {
-            Peer peer = new Peer(peerName, chatArea);
+            Peer alice = new Peer("Alice", chatArea);
 
             // Выбор сертификата OpenSSL
             X509Certificate certificate = chooseCertificate();
@@ -34,60 +32,67 @@ public class PeerChat {
                 return;
             }
 
-            // Запуск приема входящих соединений
+            String certInfo = "Certificate Info:\n" +
+                    "Subject: " + certificate.getSubjectDN().toString() + "\n" +
+                    "Issuer: " + certificate.getIssuerDN().toString() + "\n" +
+                    "Valid From: " + certificate.getNotBefore().toString() + "\n" +
+                    "Valid To: " + certificate.getNotAfter().toString() + "\n";
+
+            // Добавление отладочного сообщения
+            System.out.println("Certificate info to be sent: \n" + certInfo);
+
+            // Запуск приема входящих соединений в отдельном потоке
             new Thread(() -> {
-                try (ServerSocket serverSocket = new ServerSocket(PEER_PORT)) {
+                try (ServerSocket serverSocket = new ServerSocket(LISTEN_PORT)) {
                     while (true) {
                         Socket socket = serverSocket.accept();
-                        new Thread(new ClientHandler(socket, peer)).start();
+                        new Thread(new ClientHandler(socket, alice)).start();
                     }
                 } catch (IOException e) {
                     e.printStackTrace();
                 }
             }).start();
 
-            // Запуск обнаружения пиров
-            new Thread(() -> {
-                try (DatagramSocket socket = new DatagramSocket(DISCOVERY_PORT)) {
-                    socket.setBroadcast(true);
-                    DatagramPacket packet = new DatagramPacket(DISCOVERY_MESSAGE.getBytes(), DISCOVERY_MESSAGE.length(),
-                            InetAddress.getByName("255.255.255.255"), DISCOVERY_PORT);
-                    socket.send(packet);
+            // Подключение к другим клиентам
+            while (true) {
+                String remoteIP = JOptionPane.showInputDialog("Введите IP-адрес другого клиента для подключения");
+                if (remoteIP == null || remoteIP.isEmpty()) {
+                    break;
+                }
 
-                    byte[] buf = new byte[256];
-                    packet = new DatagramPacket(buf, buf.length);
-                    while (true) {
-                        socket.receive(packet);
-                        String received = new String(packet.getData(), 0, packet.getLength());
-                        if (received.equals(DISCOVERY_MESSAGE)) {
-                            String remoteAddress = packet.getAddress().getHostAddress();
-                            if (!remoteAddress.equals(InetAddress.getLocalHost().getHostAddress())) {
-                                connectToPeer(remoteAddress, peer, certificate);
-                            }
-                        }
-                    }
+                try {
+                    Socket socket = new Socket(remoteIP, CONNECT_PORT);
+                    alice.addWriter(new PrintWriter(socket.getOutputStream(), true));
+                    new Thread(new ClientHandler(socket, alice)).start();
+
+                    // Отправка информации о сертификате
+                    alice.broadcast("CERT|" + certInfo);
                 } catch (IOException e) {
                     e.printStackTrace();
                 }
-            }).start();
+            }
 
             inputField.addActionListener(e -> {
                 String message = inputField.getText();
                 if (!message.isEmpty()) {
                     try {
+                        // Генерация нового AES-ключа для каждой сессии
                         SecretKey sessionKey = generateAESKey();
                         String sessionKeyString = Base64.getEncoder().encodeToString(sessionKey.getEncoded());
 
+                        // Подпись сообщения
                         Signature signer = Signature.getInstance("SHA256withECDSA");
-                        signer.initSign(peer.keyPair.getPrivate());
+                        signer.initSign(alice.keyPair.getPrivate());
                         signer.update(message.getBytes());
                         byte[] signatureBytes = signer.sign();
                         String signature = Base64.getEncoder().encodeToString(signatureBytes);
 
+                        // Шифрование сообщения с использованием нового AES-ключа
                         String encryptedMessage = encryptMessage(message, sessionKey);
 
-                        String fullMessage = "MSG|" + peer.name + "|" + encryptedMessage + "|" + signature + "|" + sessionKeyString + "|" + Base64.getEncoder().encodeToString(peer.getPublicKey().getEncoded());
-                        peer.broadcast(fullMessage);
+                        // Формирование полного сообщения с передачей зашифрованного AES-ключа
+                        String fullMessage = "MSG|Alice|" + encryptedMessage + "|" + signature + "|" + sessionKeyString + "|" + Base64.getEncoder().encodeToString(alice.getPublicKey().getEncoded());
+                        alice.broadcast(fullMessage);
                         inputField.setText("");
                         chatArea.append("Me: " + message + "\n");
                     } catch (Exception ex) {
@@ -97,24 +102,6 @@ public class PeerChat {
             });
 
         } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
-    private static void connectToPeer(String remoteIP, Peer peer, X509Certificate certificate) {
-        try {
-            Socket socket = new Socket(remoteIP, PEER_PORT);
-            peer.addWriter(new PrintWriter(socket.getOutputStream(), true));
-            new Thread(new ClientHandler(socket, peer)).start();
-
-            // Отправка информации о сертификате
-            String certInfo = "Certificate Info:\n" +
-                    "Subject: " + certificate.getSubjectDN().toString() + "\n" +
-                    "Issuer: " + certificate.getIssuerDN().toString() + "\n" +
-                    "Valid From: " + certificate.getNotBefore().toString() + "\n" +
-                    "Valid To: " + certificate.getNotAfter().toString() + "\n";
-            peer.broadcast("CERT|" + certInfo);
-        } catch (IOException e) {
             e.printStackTrace();
         }
     }
@@ -185,7 +172,7 @@ public class PeerChat {
         }
 
         public void broadcast(String message) {
-            System.out.println("Broadcasting message: " + message);
+            System.out.println("Broadcasting message: " + message); // Добавлено для отладки
             synchronized (writers) {
                 for (PrintWriter writer : writers) {
                     writer.println(message);
@@ -220,7 +207,7 @@ public class PeerChat {
 
                 String message;
                 while ((message = in.readLine()) != null) {
-                    System.out.println("Received message: " + message);
+                    System.out.println("Received message: " + message); // Добавлено для отладки
                     String[] parts = message.split("\\|", 2);
                     if (parts.length == 2) {
                         String type = parts[0];
